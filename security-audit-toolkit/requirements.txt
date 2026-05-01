@@ -1,3 +1,0 @@
-# Most modules use Python stdlib only — no extra installs needed
-# Optional enhanced output:
-# tabulate>=0.9

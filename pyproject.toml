@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "security-audit-toolkit"
+version = "0.1.0"
+description = "Audit cloud / SaaS configurations against NIST CSF and CIS Benchmarks."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Batuhan Satilmis" }]
+keywords = ["security", "audit", "nist", "cis", "compliance", "cloud"]
+
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+aws = [
+    "boto3>=1.35",
+]
+m365 = [
+    "msgraph-sdk>=1.5",
+]
+
+[project.scripts]
+audit-toolkit = "audit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

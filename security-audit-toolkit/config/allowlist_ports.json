@@ -1,4 +1,0 @@
-{
-  "comment": "Add ports that are expected/approved open in your environment",
-  "allowed_ports": [22, 80, 443, 8443]
-}

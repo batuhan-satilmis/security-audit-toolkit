@@ -1,232 +1,143 @@
-# 🔒 Security Audit Toolkit
+# security-audit-toolkit
 
-> A Python-based toolkit for automated security configuration auditing, aligned with **NIST SP 800-53**, **CIS Benchmarks**, and **OWASP** guidelines.
+> Python toolkit that audits cloud and SaaS configurations against **NIST CSF** and **CIS Benchmarks** controls, then produces prioritized remediation. Built to be useful in real SMB security-posture assessments.
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat)
-![NIST](https://img.shields.io/badge/Aligned-NIST%20SP%20800--53-blue?style=flat)
-![CIS](https://img.shields.io/badge/Aligned-CIS%20Benchmarks-orange?style=flat)
+```
+$ audit-toolkit run --config audit.yaml --out report.md
+Loaded 14 checks across 3 modules (m365, aws_iam, supabase)
+[m365]      ✓ MFA enforced for all admins                                  (CIS 1.1.1)
+[m365]      ✗ Legacy auth (basic/imap) is enabled                          (CIS 1.2.1)
+[aws_iam]   ✓ Root account has MFA                                         (CIS 1.5)
+[aws_iam]   ✗ IAM users with console access older than 90 days unused      (CIS 1.12)
+[supabase]  ✓ All tables have RLS enabled                                  (custom)
+[supabase]  ✗ 2 tables missing FORCE ROW LEVEL SECURITY                    (custom)
 
----
+Findings: 3 high · 1 medium · 0 low
+Report written to report.md
+```
 
-## Overview
+## What it does
 
-The Security Audit Toolkit is a modular Python utility designed to assist security analysts and IT consultants in rapidly assessing the security posture of Linux/Unix-based systems and web application environments. Each module maps directly to recognized security control frameworks.
+For each check module, it pulls a configuration snapshot (via SDK / API), evaluates a set of rules, and emits a Markdown or JSON report with:
 
-**Built for:** Security analysts, IT consultants, system administrators, and students learning applied cybersecurity.
+- Pass/fail per check
+- Severity (info / low / medium / high / critical)
+- NIST CSF function and CIS control mapping
+- A specific remediation step (commands or console clicks) for every failure
+- Executive summary block (counts by severity, posture score)
 
----
+## Why it exists
 
-## Features
+I build this on top of every SMB engagement at [Forsman Tech](https://forsmantech.com). Every checklist-style assessment ends up needing the same automation: pull config from M365 / AWS / Supabase / Azure, evaluate against a baseline, produce a deliverable the client's IT team can actually act on. The toolkit codifies that.
 
-| Module | Description | Framework Mapping |
+It is **not** a replacement for [Prowler](https://github.com/prowler-cloud/prowler), [ScoutSuite](https://github.com/nccgroup/ScoutSuite), or AWS Security Hub — those are excellent and broader. This is a smaller, more opinionated tool focused on:
+
+- Quick to run on an engagement (single Python install).
+- Outputs a *report*, not just findings — directly usable in client deliverables.
+- Mappings to NIST CSF + CIS, the two frameworks SMB clients actually ask about.
+
+## Install
+
+```bash
+pip install -e .
+```
+
+Requires Python 3.11+.
+
+## Configure
+
+```yaml
+# audit.yaml
+output:
+  format: markdown   # or json
+  include_passing: false
+
+modules:
+  m365:
+    enabled: true
+    tenant: contoso.onmicrosoft.com
+    auth: device_code   # or service_principal
+
+  aws_iam:
+    enabled: true
+    profile: default
+    regions: [us-west-2, us-east-1]
+
+  supabase:
+    enabled: true
+    project_ref: xxxxxxx
+    service_role_key: ${SUPABASE_SERVICE_ROLE_KEY}
+```
+
+## Run
+
+```bash
+audit-toolkit run --config audit.yaml --out report.md
+audit-toolkit list-checks
+audit-toolkit show-check m365.legacy_auth_disabled
+```
+
+## Sample output
+
+See [examples/sample-report.md](./examples/sample-report.md).
+
+## What it checks (current modules)
+
+### `m365` — Microsoft 365 / Entra ID
+
+| Check ID | What | Mapping |
 |---|---|---|
-| `ssh_audit.py` | SSH configuration hardening checks | CIS Benchmark L1/L2 |
-| `file_permissions.py` | Critical file and directory permission audit | NIST AC-3, AC-6 |
-| `user_accounts.py` | User account and privilege review | NIST IA-2, AC-2 |
-| `password_policy.py` | Password policy and complexity enforcement check | NIST IA-5, CIS 5.3 |
-| `open_ports.py` | Open port enumeration and service identification | NIST SC-7, CM-7 |
-| `network_config.py` | Network configuration and firewall rule audit | NIST SC-5, SC-7 |
-| `log_audit.py` | Logging and audit trail configuration check | NIST AU-2, AU-9 |
-| `report_generator.py` | Consolidated HTML/JSON report output | — |
+| `m365.mfa_admins_enforced` | All directory-role admins have MFA enforced | CIS 1.1.1 / NIST PR.AC-1 |
+| `m365.legacy_auth_disabled` | Legacy authentication (basic/IMAP/POP) is blocked | CIS 1.2.1 |
+| `m365.password_never_expires_off` | "Password never expires" disabled (or replaced by long passphrases per NIST 800-63B) | NIST 800-63B |
+| `m365.audit_log_enabled` | Unified audit log is enabled | CIS 6.1.1 / NIST DE.AE-3 |
+| `m365.guest_invite_restricted` | Guest invitations restricted to admins | CIS 5.1 |
 
----
+### `aws_iam` — AWS IAM
 
-## Quick Start
-
-### Requirements
-
-```bash
-Python 3.10+
-pip install -r requirements.txt
-```
-
-### Installation
-
-```bash
-git clone https://github.com/batuhan-satilmis/security-audit-toolkit.git
-cd security-audit-toolkit
-pip install -r requirements.txt
-```
-
-### Run a Full Audit
-
-```bash
-# Full system audit — generates HTML report
-python main.py --full --output report.html
-
-# Run individual modules
-python modules/ssh_audit.py
-python modules/user_accounts.py
-python modules/open_ports.py
-
-# JSON output for integration with SIEM or ticketing systems
-python main.py --full --format json --output audit_results.json
-```
-
----
-
-## Module Details
-
-### `ssh_audit.py` — SSH Hardening Checks
-
-Audits `/etc/ssh/sshd_config` against CIS Benchmark recommendations:
-
-- ✅ Root login disabled (`PermitRootLogin no`)
-- ✅ Password authentication disabled (key-based only)
-- ✅ Protocol version 2 enforced
-- ✅ MaxAuthTries ≤ 4
-- ✅ LoginGraceTime ≤ 60 seconds
-- ✅ X11 forwarding disabled
-- ✅ AllowTcpForwarding disabled
-- ✅ Banner configured
-
-### `file_permissions.py` — Critical File Permissions
-
-Checks permissions on sensitive system files:
-
-- `/etc/passwd` — should be `644`
-- `/etc/shadow` — should be `640` or `000`
-- `/etc/sudoers` — should be `440`
-- `/etc/crontab` — should be `600`
-- Identifies world-writable files in `/etc/`
-- Flags SUID/SGID binaries outside expected paths
-
-### `user_accounts.py` — Account & Privilege Review
-
-- Lists all users with UID 0 (root equivalent)
-- Identifies accounts with no password set
-- Checks for unused accounts (no login in 90+ days)
-- Reviews sudoers entries for overly broad privileges
-- Flags accounts with shell access that should not have it
-
-### `password_policy.py` — Password Policy Audit
-
-Audits `/etc/login.defs` and PAM configuration:
-
-- Minimum password length ≥ 12
-- Password complexity requirements (uppercase, lowercase, digits, special chars)
-- Password expiration (PASS_MAX_DAYS ≤ 90)
-- Password reuse restrictions (remember ≥ 5)
-- Account lockout after failed attempts
-
-### `open_ports.py` — Port & Service Enumeration
-
-- Enumerates all listening ports (`ss -tlnp` / `netstat`)
-- Maps ports to known services
-- Flags unexpected or high-risk open ports
-- Identifies services running as root
-- Cross-references against a configurable allowlist
-
-### `log_audit.py` — Logging Configuration
-
-- Checks syslog/rsyslog/journald configuration
-- Verifies audit daemon (`auditd`) is running and configured
-- Checks log retention policies
-- Verifies log file permissions
-- Confirms remote logging is configured (if applicable)
-
----
-
-## Sample Report Output
-
-```
-╔══════════════════════════════════════════════════════════╗
-║          SECURITY AUDIT REPORT — 2026-03-29             ║
-║          Host: web-server-01  |  Auditor: B.Satilmis    ║
-╚══════════════════════════════════════════════════════════╝
-
-[CRITICAL] SSH: PermitRootLogin is set to 'yes' — root login should be disabled
-[CRITICAL] Accounts: 3 user accounts have no password set (guest, testuser, backup)
-[HIGH]     Permissions: /etc/shadow is world-readable (current: 644, expected: 640)
-[HIGH]     Ports: Port 23 (Telnet) is open — plaintext protocol, should be disabled
-[MEDIUM]   Password: PASS_MAX_DAYS is 180 — recommended maximum is 90
-[MEDIUM]   Logging: auditd is not running — system activity is not being audited
-[LOW]      SSH: LoginGraceTime is 120s — recommended maximum is 60s
-[INFO]     SSH: Protocol 2 enforced ✓
-[INFO]     SSH: PasswordAuthentication disabled ✓
-[INFO]     Permissions: /etc/passwd is 644 ✓
-
-──────────────────────────────────────────────────────────
-Summary: 2 Critical | 2 High | 2 Medium | 1 Low
-Risk Score: 74/100 (Needs Remediation)
-Report saved: audit_report_20260329.html
-```
-
----
-
-## Framework Mapping
-
-This toolkit maps to the following control frameworks:
-
-| Control Area | NIST SP 800-53 | CIS Benchmark |
+| Check ID | What | Mapping |
 |---|---|---|
-| Access Control | AC-2, AC-3, AC-6 | CIS 5, CIS 6 |
-| Identification & Authentication | IA-2, IA-5 | CIS 5.3, CIS 5.4 |
-| Audit & Accountability | AU-2, AU-9, AU-12 | CIS 8 |
-| System & Communications | SC-5, SC-7 | CIS 9, CIS 12 |
-| Configuration Management | CM-6, CM-7 | CIS 4 |
+| `aws_iam.root_mfa` | Root account has MFA | CIS 1.5 |
+| `aws_iam.no_root_access_keys` | Root account has no active access keys | CIS 1.4 |
+| `aws_iam.users_mfa` | All IAM users with console access have MFA | CIS 1.10 |
+| `aws_iam.unused_users` | No IAM user with console access unused for 90+ days | CIS 1.12 |
+| `aws_iam.no_wildcard_resources` | No customer-managed policy has `Resource: *` on data-access actions | NIST PR.AC-4 |
 
----
+### `supabase` — Supabase / Postgres
 
-## Project Structure
+| Check ID | What | Mapping |
+|---|---|---|
+| `supabase.rls_enabled` | All public tables have RLS enabled | custom |
+| `supabase.rls_forced` | All public tables have FORCE RLS | custom |
+| `supabase.anon_key_unused_in_admin` | Service role key never used in client code | custom |
+
+More modules planned: Google Workspace, GitHub org settings, Stripe restricted-key inventory.
+
+## Architecture
 
 ```
-security-audit-toolkit/
-├── main.py                    # Entry point — orchestrates full audit
-├── requirements.txt
-├── README.md
-├── modules/
-│   ├── ssh_audit.py
-│   ├── file_permissions.py
-│   ├── user_accounts.py
-│   ├── password_policy.py
-│   ├── open_ports.py
-│   ├── network_config.py
-│   ├── log_audit.py
-│   └── report_generator.py
-├── config/
-│   ├── allowlist_ports.json   # Configurable allowed ports
-│   └── audit_config.yaml     # Thresholds and settings
-├── reports/                   # Generated audit reports
-└── tests/
-    └── test_modules.py
+src/audit/
+  cli.py            argparse entry point
+  config.py         load + validate audit.yaml
+  findings.py       Finding dataclass; severity; NIST/CIS metadata
+  report.py         Markdown / JSON renderers
+  checks/
+    base.py         abstract Check class
+    m365.py         M365 checks
+    aws_iam.py      AWS IAM checks
+    supabase.py     Supabase checks
+tests/
+  test_findings.py
+  test_report.py
+  fixtures/
 ```
 
----
+Adding a check is ~30 lines: subclass `Check`, implement `evaluate(context) -> list[Finding]`, register in the module's `CHECKS` list.
 
-## Use Cases
+## Contributing
 
-- **Pre-deployment security review** — audit a new server before going live
-- **Compliance preparation** — identify gaps before a SOC 2 or ISO 27001 audit
-- **Periodic security hygiene** — schedule monthly audits via cron
-- **SMB security consulting** — rapid baseline assessment for client environments
-- **Security training** — hands-on learning tool for applied NIST/CIS controls
-
----
-
-## Roadmap
-
-- [ ] Windows support (registry and GPO auditing)
-- [ ] Docker/container security checks
-- [ ] AWS security group and IAM policy auditing
-- [ ] SIEM integration (Splunk, Elastic)
-- [ ] Web application OWASP header checks
-- [ ] CVE correlation for installed packages
-
----
-
-## Author
-
-**Batuhan Satilmis** — Cybersecurity Analyst & IT Security Consultant
-- 🌐 [forsmantech.com](https://forsmantech.com)
-- 💼 [LinkedIn](https://linkedin.com/in/batuhan-satilmis)
-- 📧 batuhansatilmis@outlook.com
-
----
+Issues and PRs welcome — especially new check modules. See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
-
-> ⚠️ **Disclaimer:** This toolkit is intended for use on systems you own or have explicit written authorization to audit. Unauthorized use against systems you do not own is illegal.
+MIT
