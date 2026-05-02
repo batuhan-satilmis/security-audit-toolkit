@@ -1,5 +1,9 @@
 # security-audit-toolkit
 
+[![CI](https://github.com/batuhan-satilmis/security-audit-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/batuhan-satilmis/security-audit-toolkit/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 > Python toolkit that audits cloud and SaaS configurations against **NIST CSF** and **CIS Benchmarks** controls, then produces prioritized remediation. Built to be useful in real SMB security-posture assessments.
 
 ```
