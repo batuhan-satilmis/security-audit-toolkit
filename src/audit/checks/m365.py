@@ -249,6 +249,207 @@ def _policy_covers_admin(policy: dict[str, Any], admin: dict[str, Any]) -> bool:
     return False
 
 
+# Conditional Access `clientAppTypes` values. Microsoft groups the legacy
+# (pre-modern-auth) protocols into two buckets — `exchangeActiveSync` covers
+# the legacy EAS clients, and `other` covers IMAP, POP, SMTP AUTH, MAPI,
+# Reporting Web Services, Exchange Web Services, etc. A policy that
+# genuinely "blocks legacy auth" must include BOTH buckets; including only
+# one leaves the other half open, which is a depressingly common mistake.
+LEGACY_CLIENT_APP_TYPES: frozenset[str] = frozenset({
+    "exchangeActiveSync",
+    "other",
+})
+
+
+class LegacyAuthDisabledCheck(Check):
+    """Verify a Conditional Access policy blocks legacy authentication
+    tenant-wide.
+
+    Legacy auth (basic-auth IMAP, POP, SMTP AUTH, MAPI, EWS, EAS, etc.) is
+    the #1 vector for credential-stuffing in Microsoft 365 — modern MFA is
+    irrelevant on a protocol that has no MFA challenge to begin with.
+    Microsoft retired basic auth for most protocols in 2022, but tenants
+    can re-enable it per-mailbox, and SMTP AUTH remains opt-in. CIS 1.2.1
+    requires an explicit Conditional Access policy that blocks legacy
+    client types so the tenant is protected by configuration, not by
+    Microsoft's defaults.
+
+    A passing policy must:
+
+      1) be in state 'enabled' (not report-only),
+      2) target both legacy client-app buckets (`exchangeActiveSync` and
+         `other`) — anything narrower leaves a gap,
+      3) apply to includeUsers="All" and includeApplications="All" so it
+         covers the whole tenant (per-user/per-app block policies miss the
+         inevitable shadow IT account),
+      4) not blanket-exclude every user (excludeUsers="All" would
+         effectively disable the policy), and
+      5) have grantControls.builtInControls = ["block"].
+
+    Excluding a small break-glass account or two is fine and is in fact
+    the documented Microsoft-recommended pattern; this check does not
+    flag those.
+
+    If `security_defaults_enabled` is True, the check passes — Security
+    Defaults blocks legacy authentication tenant-wide.
+    """
+
+    check_id = "m365.legacy_auth_disabled"
+    title = "Legacy authentication blocked tenant-wide"
+    description = (
+        "Legacy authentication protocols (basic-auth IMAP, POP, SMTP AUTH, "
+        "MAPI, EWS, Exchange ActiveSync) cannot be protected by MFA, which "
+        "makes them the most common entry point for credential-stuffing "
+        "attacks against Microsoft 365 tenants. CIS 1.2.1 requires an "
+        "enabled Conditional Access policy that blocks both legacy "
+        "client-app buckets (`exchangeActiveSync` and `other`) for all "
+        "users and all cloud apps. Security Defaults satisfies this "
+        "requirement automatically; otherwise an explicit CA policy is "
+        "required."
+    )
+
+    def evaluate(self, context: dict[str, Any]) -> list[Finding]:
+        # Short-circuit: Security Defaults blocks legacy auth tenant-wide.
+        if context.get("security_defaults_enabled"):
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=True,
+                severity=Severity.HIGH,
+                evidence=(
+                    "Security Defaults are enabled; legacy authentication "
+                    "is blocked for the entire tenant."
+                ),
+                cis_control="CIS 1.2.1", nist_csf="PR.AC-7",
+            )]
+
+        policies = context.get("conditional_access_policies", []) or []
+        blocking = [p for p in policies if _is_legacy_auth_blocking_policy(p)]
+
+        if blocking:
+            names = ", ".join(
+                p.get("displayName") or p.get("id") or "<unnamed>"
+                for p in blocking[:3]
+            )
+            extra = f" (+{len(blocking) - 3} more)" if len(blocking) > 3 else ""
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=True,
+                severity=Severity.HIGH,
+                evidence=(
+                    f"{len(blocking)} enabled Conditional Access "
+                    f"policy/policies block legacy client app types for all "
+                    f"users and apps: {names}{extra}."
+                ),
+                cis_control="CIS 1.2.1", nist_csf="PR.AC-7",
+            )]
+
+        # No qualifying policy. Build a precise reason so remediation is easy.
+        reason = _diagnose_missing_legacy_block(policies)
+        return [Finding(
+            check_id=self.check_id, title=self.title, passed=False,
+            severity=Severity.HIGH,
+            evidence=(
+                f"No enabled Conditional Access policy blocks legacy "
+                f"authentication tenant-wide. {reason}"
+            ),
+            remediation=(
+                "In the Entra admin center, create a Conditional Access "
+                "policy: Users → 'All users' (Exclude → at most one or two "
+                "break-glass accounts); Cloud apps → 'All cloud apps'; "
+                "Conditions → Client apps → check 'Exchange ActiveSync "
+                "clients' AND 'Other clients'; Grant → 'Block access'; "
+                "State → 'On'. Verify by attempting a basic-auth IMAP login "
+                "with a test account before broadly enabling, and watch the "
+                "sign-in logs for unexpected legacy-auth users you may need "
+                "to migrate to modern auth first."
+            ),
+            cis_control="CIS 1.2.1", nist_csf="PR.AC-7",
+            references=[
+                "https://learn.microsoft.com/azure/active-directory/conditional-access/howto-conditional-access-policy-block-legacy",
+                "https://www.cisecurity.org/benchmark/microsoft_365",
+            ],
+        )]
+
+
+def _is_legacy_auth_blocking_policy(policy: dict[str, Any]) -> bool:
+    """An enabled CA policy that blocks legacy auth tenant-wide.
+
+    See LegacyAuthDisabledCheck for the definition. We deliberately require
+    the policy to apply to includeUsers="All" / includeApplications="All";
+    a narrower scope can satisfy a paper checkbox but leaves the tenant
+    open to a single un-scoped account. Excluding a break-glass account
+    is allowed; excluding "All" is treated as effectively disabling the
+    policy.
+    """
+    if policy.get("state") != "enabled":
+        return False
+
+    grant = policy.get("grantControls") or {}
+    if "block" not in (grant.get("builtInControls") or []):
+        return False
+
+    client_app_types = set(policy.get("clientAppTypes") or [])
+    if not LEGACY_CLIENT_APP_TYPES.issubset(client_app_types):
+        return False
+
+    conditions = policy.get("conditions") or {}
+    users = conditions.get("users") or {}
+    if "All" not in (users.get("includeUsers") or []):
+        return False
+    if "All" in (users.get("excludeUsers") or []):
+        # Excluding everyone effectively disables the policy.
+        return False
+
+    apps = conditions.get("applications") or {}
+    if "All" not in (apps.get("includeApplications") or []):
+        return False
+
+    return True
+
+
+def _diagnose_missing_legacy_block(policies: list[dict[str, Any]]) -> str:
+    """Return a short human reason for why no policy qualifies.
+
+    Walks the candidate policies in priority order — the failure that's
+    closest to being a working policy is the one that's most useful to
+    surface to the operator.
+    """
+    if not policies:
+        return "No Conditional Access policies are configured."
+
+    enabled = [p for p in policies if p.get("state") == "enabled"]
+    if not enabled:
+        return (
+            f"{len(policies)} CA policy/policies exist but none are in state "
+            "'enabled' (report-only mode does not enforce blocks)."
+        )
+
+    blocking = [
+        p for p in enabled
+        if "block" in ((p.get("grantControls") or {}).get("builtInControls") or [])
+    ]
+    if not blocking:
+        return (
+            "Enabled CA policies exist but none use 'block' in grantControls."
+        )
+
+    legacy_targeted = [
+        p for p in blocking
+        if LEGACY_CLIENT_APP_TYPES.issubset(set(p.get("clientAppTypes") or []))
+    ]
+    if not legacy_targeted:
+        return (
+            "A blocking policy is enabled but its `clientAppTypes` does not "
+            "cover both legacy buckets (`exchangeActiveSync` AND `other`); "
+            "this is the most common partial-implementation mistake."
+        )
+
+    return (
+        "A blocking, legacy-auth-targeted policy exists but is not scoped "
+        "to All users + All cloud apps (or excludes 'All' users), so it "
+        "does not protect the whole tenant."
+    )
+
+
 CHECKS: list[Check] = [
     MfaAdminsEnforcedCheck(),
+    LegacyAuthDisabledCheck(),
 ]
