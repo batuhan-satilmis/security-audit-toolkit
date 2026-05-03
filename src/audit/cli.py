@@ -13,13 +13,14 @@ from pathlib import Path
 
 from audit.checks.aws_iam import CHECKS as AWS_IAM_CHECKS
 from audit.checks.base import Check
+from audit.checks.m365 import CHECKS as M365_CHECKS
 from audit.findings import Finding
 from audit.report import render_json, render_markdown
 
 # Module registry. Add a module by adding to this dict.
 ALL_MODULES: dict[str, list[Check]] = {
+    "m365": M365_CHECKS,
     "aws_iam": AWS_IAM_CHECKS,
-    # "m365": M365_CHECKS,            # populated when m365 module is enabled
     # "supabase": SUPABASE_CHECKS,    # populated when supabase module is enabled
 }
 
@@ -48,11 +49,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     # In a full implementation we'd parse audit.yaml and pull live config via
     # boto3 / Microsoft Graph / Supabase API. For this scaffold we run against
     # fixtures so the CLI is verifiable end-to-end.
-    from audit.fixtures import sample_aws_context
+    from audit.fixtures import sample_aws_context, sample_m365_context
 
+    module_contexts = {
+        "m365": sample_m365_context(),
+        "aws_iam": sample_aws_context(),
+    }
     findings: list[Finding] = []
-    for check in ALL_MODULES["aws_iam"]:
-        findings.extend(check.evaluate(sample_aws_context()))
+    for module_name, checks in ALL_MODULES.items():
+        ctx = module_contexts.get(module_name)
+        if ctx is None:
+            continue
+        for check in checks:
+            findings.extend(check.evaluate(ctx))
 
     if args.format == "json":
         out = render_json(findings)

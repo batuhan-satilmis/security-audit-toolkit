@@ -46,3 +46,51 @@ def sample_aws_context() -> dict[str, Any]:
         "users": [],
         "policies": [],
     }
+
+
+def sample_m365_context() -> dict[str, Any]:
+    """A deliberately mediocre M365 posture so the demo report has findings.
+
+    Two admins exist; the Conditional Access policy that requires MFA includes
+    the Global Administrator role but excludes user `legacy_admin@…`, leaving
+    that admin uncovered. This is a common real-world failure mode (an
+    excluded "break-glass" account that has drifted into being a regular
+    admin's day-to-day account).
+    """
+    GLOBAL_ADMIN = "62e90394-69f5-4237-9190-012177145e10"
+    return {
+        "directory_roles": [
+            {
+                "id": "role-1",
+                "displayName": "Global Administrator",
+                "roleTemplateId": GLOBAL_ADMIN,
+            },
+        ],
+        "directory_role_members": {
+            GLOBAL_ADMIN: [
+                {"id": "user-1", "userPrincipalName": "alice@contoso.com"},
+                {"id": "user-2", "userPrincipalName": "legacy_admin@contoso.com"},
+            ],
+        },
+        "conditional_access_policies": [
+            {
+                "id": "ca-1",
+                "displayName": "Require MFA for admins",
+                "state": "enabled",
+                "conditions": {
+                    "users": {
+                        "includeUsers": [],
+                        "includeRoles": [GLOBAL_ADMIN],
+                        "excludeUsers": ["user-2"],   # the drifted exclusion
+                        "excludeRoles": [],
+                    },
+                    "applications": {"includeApplications": ["All"]},
+                },
+                "grantControls": {
+                    "builtInControls": ["mfa"],
+                    "operator": "OR",
+                },
+            },
+        ],
+        "security_defaults_enabled": False,
+    }
