@@ -140,7 +140,7 @@ Adding a check is ~30 lines: subclass `Check`, implement `evaluate(context) -> l
 
 ## Contributing
 
-Issues and PRs welcome — especially new check modules. See [CONTRIBUTING.md](./CONTRIBUTING.md).
+Issues and PRs welcome — especially new check modules.
 
 ## License
 
