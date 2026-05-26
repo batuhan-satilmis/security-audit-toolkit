@@ -12,8 +12,11 @@ from typing import Any
 import pytest
 
 from audit.checks.m365 import (
+    ALLOWED_INVITE_FROM,
     LEGACY_CLIENT_APP_TYPES,
+    MEMBER_USER_ROLE_TEMPLATE_ID,
     PRIVILEGED_ROLE_TEMPLATE_IDS,
+    GuestInviteRestrictedCheck,
     LegacyAuthDisabledCheck,
     MfaAdminsEnforcedCheck,
 )
@@ -397,3 +400,152 @@ def test_legacy_client_app_types_constant_is_exactly_the_two_legacy_buckets():
     `other`. Anything else (browser, mobileAppsAndDesktopClients) is
     modern auth and must NOT be in this constant."""
     assert LEGACY_CLIENT_APP_TYPES == frozenset({"exchangeActiveSync", "other"})
+
+
+
+# ---------------------------------------------------------------------------
+# GuestInviteRestrictedCheck — m365.guest_invite_restricted (CIS 5.1)
+# ---------------------------------------------------------------------------
+
+
+GUEST_USER_ROLE_ID = "10dae51f-b6af-4016-8d66-8c2a99b929b3"          # standard Guest
+RESTRICTED_GUEST_ROLE_ID = "2af84b1e-32c8-42b7-82bc-daa82404023b"    # Restricted Guest
+
+
+def _ctx_with_auth_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
+    """Build an M365 context that only exercises the authorization policy.
+
+    Other context keys are populated so checks that share the dict don't
+    crash if the fixture is reused, but only the policy matters here.
+    """
+    ctx = _ctx()
+    if policy is not None:
+        ctx["authorization_policy"] = policy
+    return ctx
+
+
+@pytest.fixture
+def guest_check() -> GuestInviteRestrictedCheck:
+    return GuestInviteRestrictedCheck()
+
+
+def test_guest_passes_when_invites_restricted_to_admins(guest_check):
+    """The CIS-recommended posture: only admins / Guest Inviters can invite."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "adminsAndGuestInviters",
+        "guestUserRoleId": GUEST_USER_ROLE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is True
+    assert finding.cis_control == "CIS 5.1"
+    assert finding.nist_csf == "PR.AC-4"
+
+
+def test_guest_passes_when_invites_disabled_entirely(guest_check):
+    """`allowInvitesFrom='none'` is even stricter and must also pass."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "none",
+        "guestUserRoleId": GUEST_USER_ROLE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is True
+
+
+def test_guest_passes_with_restricted_guest_role(guest_check):
+    """The Restricted Guest role is more locked-down than the standard
+    Guest role and must also satisfy the role-id sub-check."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "adminsAndGuestInviters",
+        "guestUserRoleId": RESTRICTED_GUEST_ROLE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is True
+
+
+def test_guest_fails_when_all_members_can_invite(guest_check):
+    """Tenant default — every member can invite arbitrary externals.
+    This is the most common real-world failure mode."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "adminsGuestInvitersAndAllMembers",
+        "guestUserRoleId": GUEST_USER_ROLE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.MEDIUM
+    assert "adminsGuestInvitersAndAllMembers" in finding.evidence
+    assert finding.remediation, "Failing finding must carry remediation."
+
+
+def test_guest_fails_when_everyone_can_invite_and_severity_escalates(guest_check):
+    """`allowInvitesFrom='everyone'` lets existing guests invite further
+    guests — materially worse than the default, so severity must be HIGH."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "everyone",
+        "guestUserRoleId": GUEST_USER_ROLE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.HIGH
+    assert "everyone" in finding.evidence
+
+
+def test_guest_fails_when_role_id_is_member(guest_check):
+    """Even with the strictest invite policy, pointing guestUserRoleId at
+    the default Member role silently grants member-equivalent directory
+    permissions to invited guests."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "adminsAndGuestInviters",
+        "guestUserRoleId": MEMBER_USER_ROLE_TEMPLATE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is False
+    assert "Member role" in finding.evidence
+
+
+def test_guest_fails_compound_message_lists_both_reasons(guest_check):
+    """When both sub-conditions are violated, the evidence must enumerate
+    both — an operator triaging the finding shouldn't have to fix one and
+    re-run the audit to discover the second."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "everyone",
+        "guestUserRoleId": MEMBER_USER_ROLE_TEMPLATE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is False
+    assert "everyone" in finding.evidence
+    assert "Member role" in finding.evidence
+
+
+def test_guest_reports_info_when_policy_not_collected(guest_check):
+    """A missing `authorization_policy` key indicates the collector lacked
+    the Policy.Read.All permission, not that the tenant is misconfigured.
+    Reporting CRITICAL here would dominate the report; INFO + a precise
+    remediation pointing at the missing Graph permission is the right
+    behavior."""
+    ctx = _ctx()
+    # Sanity: the default _ctx() helper does not set authorization_policy.
+    assert "authorization_policy" not in ctx
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "Policy.Read.All" in finding.remediation
+
+
+def test_guest_unknown_enum_value_fails_safely(guest_check):
+    """If Microsoft adds a new `allowInvitesFrom` enum value we haven't
+    audited yet, the check must fail-closed rather than silently treat it
+    as compliant."""
+    ctx = _ctx_with_auth_policy({
+        "allowInvitesFrom": "someFutureValue",
+        "guestUserRoleId": GUEST_USER_ROLE_ID,
+    })
+    [finding] = guest_check.evaluate(ctx)
+    assert finding.passed is False
+    assert "someFutureValue" in finding.evidence
+
+
+def test_allowed_invite_from_constant_is_least_permissive_pair():
+    """The constant must include exactly the two least-permissive enum
+    values. Adding the third value would silently weaken every tenant
+    audit; dropping one would over-flag the strictest tenants."""
+    assert ALLOWED_INVITE_FROM == frozenset({"none", "adminsAndGuestInviters"})

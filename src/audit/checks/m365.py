@@ -449,7 +449,175 @@ def _diagnose_missing_legacy_block(policies: list[dict[str, Any]]) -> str:
     )
 
 
+
+# Microsoft Graph `authorizationPolicy.allowInvitesFrom` enum. Order = least
+# permissive → most permissive:
+#
+#   - "none":                                  Nobody can invite guests; only
+#                                              user creation via admin APIs.
+#   - "adminsAndGuestInviters":                Only Global Administrators,
+#                                              User Administrators, and members
+#                                              of the "Guest Inviter" directory
+#                                              role can invite. CIS-recommended.
+#   - "adminsGuestInvitersAndAllMembers":      Default for many tenants — every
+#                                              member can invite any external
+#                                              user. Often the unintended state
+#                                              after a migration.
+#   - "everyone":                              Existing guests can also invite
+#                                              more guests. Effectively no
+#                                              guardrail.
+#
+# CIS Microsoft 365 Foundations Benchmark requires this to be one of the
+# first two values; the latter two fail the check.
+ALLOWED_INVITE_FROM: frozenset[str] = frozenset({
+    "none",
+    "adminsAndGuestInviters",
+})
+
+# Default "Member" user role template id. If `guestUserRoleId` is set to this,
+# guests inherit full member permissions — a posture that defeats the
+# purpose of distinguishing guests in the first place.
+MEMBER_USER_ROLE_TEMPLATE_ID: str = "a0b1b346-4d3e-4e8b-98f8-753987be4970"
+
+
+class GuestInviteRestrictedCheck(Check):
+    """Verify guest invitations are restricted to admins / Guest Inviters
+    and that guests don't inherit member-equivalent permissions.
+
+    Two distinct attack surfaces share this one Entra ID policy:
+
+      1. Who is allowed to *send* an invite. Default tenants let every member
+         invite — which makes spear-phishing-as-an-employee trivial (attacker
+         compromises any user, invites their own attacker-controlled email
+         address as a guest, signs in with MFA-equipped fresh identity, and
+         operates inside the tenant as a low-friction insider).
+      2. What the resulting guest can *do*. The `guestUserRoleId` controls
+         how much directory information the guest can read. If it's left at
+         the default Member role id, guests can enumerate the directory the
+         same as full members — useful reconnaissance for later attacks.
+
+    A passing posture sets `allowInvitesFrom` to either `none` or
+    `adminsAndGuestInviters` AND keeps `guestUserRoleId` at the standard
+    Guest or Restricted Guest role (i.e. NOT the Member role id). Any
+    deviation is flagged.
+
+    The check operates on a single Graph object:
+
+        context["authorization_policy"] = {
+            "allowInvitesFrom": "<enum value>",
+            "guestUserRoleId": "<guid>",
+            # other fields ignored
+        }
+
+    If the dict is missing entirely we treat it as a collection failure,
+    not a config failure, and report INFO so a partial run isn't drowned
+    in noise from one unauthenticated module call.
+    """
+
+    check_id = "m365.guest_invite_restricted"
+    title = "Guest invitations restricted to admins / Guest Inviters"
+    description = (
+        "Default Microsoft 365 tenants let every member invite arbitrary "
+        "external guests, which turns guest invitation into a quiet "
+        "lateral-movement primitive (any compromised user can introduce a "
+        "controlled identity into the directory). CIS Microsoft 365 "
+        "Foundations Benchmark requires `allowInvitesFrom` to be set to "
+        "either `none` or `adminsAndGuestInviters`. This check additionally "
+        "verifies that `guestUserRoleId` is not pointed at the default "
+        "Member role, which would silently grant invited guests "
+        "member-equivalent directory read permissions."
+    )
+
+    def evaluate(self, context: dict[str, Any]) -> list[Finding]:
+        policy = context.get("authorization_policy")
+        if policy is None:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.INFO,
+                evidence=(
+                    "authorizationPolicy was not collected from Microsoft "
+                    "Graph; the runtime collector may have lacked the "
+                    "Policy.Read.All permission."
+                ),
+                remediation=(
+                    "Grant the audit application the Policy.Read.All Graph "
+                    "permission (admin consent required) and re-run the "
+                    "collector. The single Graph endpoint required is "
+                    "GET /policies/authorizationPolicy."
+                ),
+                cis_control="CIS 5.1", nist_csf="PR.AC-4",
+            )]
+
+        allow_invites_from = policy.get("allowInvitesFrom")
+        guest_role_id = policy.get("guestUserRoleId")
+
+        invite_ok = allow_invites_from in ALLOWED_INVITE_FROM
+        role_ok = guest_role_id != MEMBER_USER_ROLE_TEMPLATE_ID
+
+        if invite_ok and role_ok:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=True,
+                severity=Severity.MEDIUM,
+                evidence=(
+                    f"authorizationPolicy.allowInvitesFrom={allow_invites_from!r}; "
+                    f"guestUserRoleId is not the default Member role."
+                ),
+                cis_control="CIS 5.1", nist_csf="PR.AC-4",
+            )]
+
+        # Failing path. Build a precise message — the operator should not
+        # have to guess which of the two sub-conditions tripped.
+        reasons: list[str] = []
+        if not invite_ok:
+            reasons.append(
+                f"allowInvitesFrom={allow_invites_from!r} "
+                "(must be 'none' or 'adminsAndGuestInviters')"
+            )
+        if not role_ok:
+            reasons.append(
+                "guestUserRoleId is set to the default Member role id "
+                f"({MEMBER_USER_ROLE_TEMPLATE_ID}); guests would inherit "
+                "member-equivalent directory permissions"
+            )
+
+        # 'everyone' is materially worse than 'adminsGuestInvitersAndAllMembers'
+        # because it lets existing guests recruit further guests. Reflect
+        # that in the severity so triage sorts it above the merely-permissive
+        # default.
+        severity = (
+            Severity.HIGH if allow_invites_from == "everyone" else Severity.MEDIUM
+        )
+
+        return [Finding(
+            check_id=self.check_id, title=self.title, passed=False,
+            severity=severity,
+            evidence="; ".join(reasons),
+            remediation=(
+                "In the Entra admin center, open External Identities → "
+                "External collaboration settings. Set 'Guest invite settings' "
+                "to 'Only users assigned to specific admin roles can invite "
+                "guest users' (equivalent to allowInvitesFrom="
+                "'adminsAndGuestInviters'). Under 'Guest user access', "
+                "select 'Guest users have limited access to properties and "
+                "memberships of directory objects' or stricter — never "
+                "'same as member users'. If your tenant requires self-"
+                "service invitation for a specific team, grant those users "
+                "the 'Guest Inviter' directory role instead of widening the "
+                "tenant-wide policy. Audit existing guests after tightening "
+                "(`Get-MgUser -Filter \"userType eq 'Guest'\"`) — past "
+                "over-permissive invites do not retroactively disappear."
+            ),
+            cis_control="CIS 5.1", nist_csf="PR.AC-4",
+            references=[
+                "https://learn.microsoft.com/azure/active-directory/external-identities/external-collaboration-settings-configure",
+                "https://learn.microsoft.com/graph/api/resources/authorizationpolicy",
+                "https://www.cisecurity.org/benchmark/microsoft_365",
+            ],
+        )]
+
+
 CHECKS: list[Check] = [
     MfaAdminsEnforcedCheck(),
     LegacyAuthDisabledCheck(),
+    GuestInviteRestrictedCheck(),
 ]

@@ -93,4 +93,11 @@ def sample_m365_context() -> dict[str, Any]:
             },
         ],
         "security_defaults_enabled": False,
+        # Default tenant posture: every member can invite arbitrary guests.
+        # Triggers m365.guest_invite_restricted as a real-world failure case.
+        "authorization_policy": {
+            "allowInvitesFrom": "adminsGuestInvitersAndAllMembers",
+            # Standard "Guest user" role id — not the over-permissive Member role.
+            "guestUserRoleId": "10dae51f-b6af-4016-8d66-8c2a99b929b3",
+        },
     }
