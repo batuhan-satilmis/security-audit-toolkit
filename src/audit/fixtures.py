@@ -99,5 +99,11 @@ def sample_m365_context() -> dict[str, Any]:
             "allowInvitesFrom": "adminsGuestInvitersAndAllMembers",
             # Standard "Guest user" role id — not the over-permissive Member role.
             "guestUserRoleId": "10dae51f-b6af-4016-8d66-8c2a99b929b3",
+            # Tenant default is True — every member can register OAuth apps.
+            # Triggers m365.user_app_registration_restricted so the demo
+            # report surfaces the illicit-consent-grant surface.
+            "defaultUserRolePermissions": {
+                "allowedToCreateApps": True,
+            },
         },
     }

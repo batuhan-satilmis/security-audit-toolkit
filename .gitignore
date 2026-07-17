@@ -3,3 +3,11 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Editable-install and virtualenv artifacts (excluded so ad-hoc pip installs
+# during a test run don't pollute the tree; the build system regenerates
+# egg-info on demand).
+*.egg-info/
+.venv/
+build/
+dist/

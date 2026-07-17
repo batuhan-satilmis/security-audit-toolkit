@@ -616,8 +616,173 @@ class GuestInviteRestrictedCheck(Check):
         )]
 
 
+
+class UserAppRegistrationRestrictedCheck(Check):
+    """Verify non-admin users cannot register applications in Entra ID.
+
+    User-created app registrations are the primary pivot for the OAuth
+    "illicit consent grant" attack pattern (MITRE ATT&CK T1528 — Steal
+    Application Access Token; T1550.001 — Application Access Token abuse).
+    A tenant member registers a benign-looking app, requests delegated
+    permissions like `Mail.Read` or `Files.Read.All`, socially engineers
+    other tenant users into consenting, and now holds refresh-token access
+    to those users' mail and files — survives password resets, MFA challenges,
+    and Conditional Access re-evaluation until the specific token is
+    explicitly revoked. Nobelium/APT29 used this pattern extensively during
+    the post-SolarWinds intrusion set to maintain access after credential
+    resets.
+
+    Microsoft's Entra ID default is `allowedToCreateApps=true` — every
+    tenant member can register apps. CIS Microsoft 365 Foundations
+    Benchmark §5.1.3 requires this be set to `false`, restricting app
+    registration to Global Administrators, Application Administrators, and
+    Cloud Application Administrators (roles that are already covered by
+    other privileged-access controls).
+
+    The check operates on the same `/policies/authorizationPolicy` object
+    used by `guest_invite_restricted`:
+
+        context["authorization_policy"] = {
+            "defaultUserRolePermissions": {
+                "allowedToCreateApps": bool,
+                # other fields ignored by this check
+            },
+            # other fields ignored
+        }
+
+    A missing `authorization_policy` or missing `defaultUserRolePermissions`
+    subkey is reported as INFO (collection gap, not a config finding) so a
+    partial run does not misattribute the issue.
+    """
+
+    check_id = "m365.user_app_registration_restricted"
+    title = "Non-admin users cannot register applications in Entra ID"
+    description = (
+        "Default Microsoft 365 tenants let every member register OAuth "
+        "applications, which is the pivot for illicit-consent-grant "
+        "attacks (MITRE T1528): register a benign-looking app, request "
+        "delegated Graph permissions like Mail.Read or Files.Read.All, "
+        "phish other tenant users into consenting, and hold "
+        "refresh-token access that survives password resets. CIS "
+        "Microsoft 365 Foundations Benchmark §5.1.3 requires "
+        "`defaultUserRolePermissions.allowedToCreateApps` be set to "
+        "`false` on the authorization policy so that only Application "
+        "Administrator / Cloud Application Administrator / Global "
+        "Administrator role holders can register apps."
+    )
+
+    def evaluate(self, context: dict[str, Any]) -> list[Finding]:
+        policy = context.get("authorization_policy")
+        if policy is None:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.INFO,
+                evidence=(
+                    "authorizationPolicy was not collected from Microsoft "
+                    "Graph; the runtime collector may have lacked the "
+                    "Policy.Read.All permission."
+                ),
+                remediation=(
+                    "Grant the audit application the Policy.Read.All Graph "
+                    "permission (admin consent required) and re-run the "
+                    "collector. The single Graph endpoint required is "
+                    "GET /policies/authorizationPolicy."
+                ),
+                cis_control="CIS 5.1.3", nist_csf="PR.AC-4",
+            )]
+
+        default_role_perms = policy.get("defaultUserRolePermissions")
+        if default_role_perms is None:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.INFO,
+                evidence=(
+                    "authorizationPolicy.defaultUserRolePermissions was not "
+                    "returned by Microsoft Graph. This can happen if the "
+                    "collector was querying an older beta endpoint that "
+                    "omits the subobject; re-run against the v1.0 endpoint."
+                ),
+                remediation=(
+                    "Confirm the collector calls "
+                    "`GET https://graph.microsoft.com/v1.0/policies/"
+                    "authorizationPolicy` and passes the full response "
+                    "through — do not project fields defensively at "
+                    "collection time."
+                ),
+                cis_control="CIS 5.1.3", nist_csf="PR.AC-4",
+            )]
+
+        allowed_to_create_apps = default_role_perms.get("allowedToCreateApps")
+
+        # Explicitly False is a pass. Explicitly True is a fail. Anything
+        # else (None, missing key) is treated as INFO — we don't want to
+        # emit a critical false-positive because Microsoft renamed a field
+        # or the collector is on an old SDK.
+        if allowed_to_create_apps is False:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=True,
+                severity=Severity.HIGH,
+                evidence=(
+                    "defaultUserRolePermissions.allowedToCreateApps=false; "
+                    "only Application/Cloud Application/Global Administrator "
+                    "roles can register apps."
+                ),
+                cis_control="CIS 5.1.3", nist_csf="PR.AC-4",
+            )]
+
+        if allowed_to_create_apps is True:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.HIGH,
+                evidence=(
+                    "defaultUserRolePermissions.allowedToCreateApps=true "
+                    "(tenant default); every tenant member can register "
+                    "OAuth applications and thus initiate illicit-consent-"
+                    "grant campaigns."
+                ),
+                remediation=(
+                    "In the Entra admin center, open Identity → Users → "
+                    "User settings → App registrations and set 'Users can "
+                    "register applications' to 'No'. Equivalent Graph "
+                    "call: PATCH /policies/authorizationPolicy with "
+                    "{\"defaultUserRolePermissions\": "
+                    "{\"allowedToCreateApps\": false}}. After tightening, "
+                    "audit existing enterprise applications (`Get-MgServicePrincipal "
+                    "-Filter \"servicePrincipalType eq 'Application'\"`) "
+                    "and revoke consent for any app that no admin explicitly "
+                    "approved. Pair with a Conditional-Access user-consent "
+                    "policy (\"Users can consent to apps from verified "
+                    "publishers, for selected permissions\") to close the "
+                    "second half of the illicit-consent-grant surface."
+                ),
+                cis_control="CIS 5.1.3", nist_csf="PR.AC-4",
+                references=[
+                    "https://learn.microsoft.com/entra/identity/enterprise-apps/restrict-user-consent",
+                    "https://learn.microsoft.com/graph/api/resources/authorizationpolicy",
+                    "https://attack.mitre.org/techniques/T1528/",
+                    "https://www.cisecurity.org/benchmark/microsoft_365",
+                ],
+            )]
+
+        return [Finding(
+            check_id=self.check_id, title=self.title, passed=False,
+            severity=Severity.INFO,
+            evidence=(
+                "defaultUserRolePermissions.allowedToCreateApps is "
+                f"{allowed_to_create_apps!r} (expected explicit bool). "
+                "Treated as a collection gap rather than a policy finding."
+            ),
+            remediation=(
+                "Confirm the runtime collector is not projecting the "
+                "subobject through a schema that strips unknown types."
+            ),
+            cis_control="CIS 5.1.3", nist_csf="PR.AC-4",
+        )]
+
+
 CHECKS: list[Check] = [
     MfaAdminsEnforcedCheck(),
     LegacyAuthDisabledCheck(),
     GuestInviteRestrictedCheck(),
+    UserAppRegistrationRestrictedCheck(),
 ]

@@ -19,6 +19,7 @@ from audit.checks.m365 import (
     GuestInviteRestrictedCheck,
     LegacyAuthDisabledCheck,
     MfaAdminsEnforcedCheck,
+    UserAppRegistrationRestrictedCheck,
 )
 from audit.findings import Severity
 
@@ -549,3 +550,125 @@ def test_allowed_invite_from_constant_is_least_permissive_pair():
     values. Adding the third value would silently weaken every tenant
     audit; dropping one would over-flag the strictest tenants."""
     assert ALLOWED_INVITE_FROM == frozenset({"none", "adminsAndGuestInviters"})
+
+
+# ----------------------------------------------------------------------
+# UserAppRegistrationRestrictedCheck — m365.user_app_registration_restricted
+# (CIS 5.1.3). Same authorizationPolicy Graph object as the guest-invite
+# check, so the fixture helper is deliberately reused.
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def app_reg_check() -> UserAppRegistrationRestrictedCheck:
+    return UserAppRegistrationRestrictedCheck()
+
+
+def _ctx_with_default_role_perms(
+    *, allowed_to_create_apps: bool | None,
+    extra_policy_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a minimal context with authorizationPolicy.defaultUserRolePermissions
+    populated. `allowed_to_create_apps=None` produces an empty
+    defaultUserRolePermissions subobject (subkey absent) — useful for the
+    partial-collection-gap case."""
+    default_role_perms: dict[str, Any] = {}
+    if allowed_to_create_apps is not None:
+        default_role_perms["allowedToCreateApps"] = allowed_to_create_apps
+    policy: dict[str, Any] = {"defaultUserRolePermissions": default_role_perms}
+    if extra_policy_fields:
+        policy.update(extra_policy_fields)
+    ctx = _ctx()
+    ctx["authorization_policy"] = policy
+    return ctx
+
+
+def test_app_reg_passes_when_allowed_to_create_apps_false(app_reg_check):
+    """CIS 5.1.3-compliant tenant: only admins can register apps."""
+    ctx = _ctx_with_default_role_perms(allowed_to_create_apps=False)
+    [finding] = app_reg_check.evaluate(ctx)
+    assert finding.passed is True
+    assert finding.severity == Severity.HIGH
+    assert finding.cis_control == "CIS 5.1.3"
+    assert finding.nist_csf == "PR.AC-4"
+    assert "allowedToCreateApps=false" in finding.evidence
+
+
+def test_app_reg_fails_when_allowed_to_create_apps_true(app_reg_check):
+    """Default tenant posture — every member can register OAuth apps and
+    thus initiate an illicit-consent-grant campaign."""
+    ctx = _ctx_with_default_role_perms(allowed_to_create_apps=True)
+    [finding] = app_reg_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.HIGH
+    assert finding.cis_control == "CIS 5.1.3"
+    assert "allowedToCreateApps=true" in finding.evidence
+    # Remediation must name both halves of the fix — the setting itself and
+    # the follow-up SP audit. A tightening that leaves already-consented
+    # apps in place doesn't actually close the exposure.
+    assert "Users can register applications" in finding.remediation
+    assert "Get-MgServicePrincipal" in finding.remediation
+    # And the JSON Graph patch body must be well-formed so a copy/paste from
+    # a report actually works.
+    assert '"allowedToCreateApps": false' in finding.remediation
+
+
+def test_app_reg_remediation_covers_consent_pairing(app_reg_check):
+    """Restricting app registration is only half of the illicit-consent
+    grant surface; the other half is user consent to already-registered
+    apps. The remediation must explicitly point at the CA user-consent
+    policy so an operator following the guidance closes both halves."""
+    ctx = _ctx_with_default_role_perms(allowed_to_create_apps=True)
+    [finding] = app_reg_check.evaluate(ctx)
+    assert "verified publishers" in finding.remediation
+
+
+def test_app_reg_references_include_mitre_and_ms_docs(app_reg_check):
+    """The failing-case Finding must cite (a) the Microsoft docs page for
+    the remediation, (b) the MITRE ATT&CK technique the check defends
+    against, and (c) the CIS benchmark itself — the three anchors a
+    hiring manager or auditor would want to trace back to."""
+    ctx = _ctx_with_default_role_perms(allowed_to_create_apps=True)
+    [finding] = app_reg_check.evaluate(ctx)
+    joined = " ".join(finding.references)
+    assert "attack.mitre.org/techniques/T1528" in joined
+    assert "restrict-user-consent" in joined
+    assert "cisecurity.org/benchmark/microsoft_365" in joined
+
+
+def test_app_reg_reports_info_when_policy_not_collected(app_reg_check):
+    """Missing `authorization_policy` is a collection gap, not a config
+    finding. INFO + Policy.Read.All remediation, same as the guest-invite
+    check — an unauthenticated module call should not dominate the
+    posture score."""
+    ctx = _ctx()
+    assert "authorization_policy" not in ctx
+    [finding] = app_reg_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "Policy.Read.All" in finding.remediation
+
+
+def test_app_reg_reports_info_when_default_role_perms_missing(app_reg_check):
+    """A partial authorizationPolicy (missing defaultUserRolePermissions
+    subobject) is also a collection gap — the beta endpoint used to omit
+    it. Fail-open with INFO and a v1.0-endpoint remediation."""
+    ctx = _ctx()
+    ctx["authorization_policy"] = {"allowInvitesFrom": "adminsAndGuestInviters"}
+    [finding] = app_reg_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "defaultUserRolePermissions" in finding.evidence
+    assert "v1.0" in finding.remediation
+
+
+def test_app_reg_reports_info_on_non_bool_allowed_to_create_apps(app_reg_check):
+    """If Microsoft ever returns a non-bool (string enum, null, missing) we
+    must not silently pass or emit a critical false-positive. INFO with a
+    schema-drift note is the right behavior — one weird value shouldn't
+    contaminate the posture score."""
+    ctx = _ctx_with_default_role_perms(allowed_to_create_apps=None)
+    [finding] = app_reg_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "expected explicit bool" in finding.evidence
