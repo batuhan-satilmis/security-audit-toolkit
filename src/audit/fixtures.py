@@ -104,6 +104,15 @@ def sample_m365_context() -> dict[str, Any]:
             # report surfaces the illicit-consent-grant surface.
             "defaultUserRolePermissions": {
                 "allowedToCreateApps": True,
+                # Historical Entra default — every tenant member can consent
+                # to any OAuth app for any 'low-impact' delegated permission
+                # (which includes Mail.Read, Files.Read.All, offline_access).
+                # Fails m365.user_consent_to_apps_restricted so the demo
+                # report shows both halves of the illicit-consent-grant
+                # surface (MITRE T1528) failing together.
+                "permissionGrantPoliciesAssigned": [
+                    "ManagePermissionGrantsForSelf.microsoft-user-default-legacy",
+                ],
             },
         },
     }

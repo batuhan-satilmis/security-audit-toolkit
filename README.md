@@ -97,6 +97,7 @@ See [examples/sample-report.md](./examples/sample-report.md).
 | `m365.audit_log_enabled` | Unified audit log is enabled | CIS 6.1.1 / NIST DE.AE-3 |
 | `m365.guest_invite_restricted` | Guest invitations restricted to admins | CIS 5.1 |
 | `m365.user_app_registration_restricted` | Non-admin users cannot register OAuth apps (illicit-consent-grant surface, MITRE T1528) | CIS 5.1.3 / NIST PR.AC-4 |
+| `m365.user_consent_to_apps_restricted` | User consent to OAuth apps restricted to verified publishers (second half of the illicit-consent-grant surface, MITRE T1528) | CIS 5.1.5 / NIST PR.AC-4 |
 
 ### `aws_iam` — AWS IAM
 

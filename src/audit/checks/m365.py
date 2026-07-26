@@ -780,9 +780,289 @@ class UserAppRegistrationRestrictedCheck(Check):
         )]
 
 
+# Microsoft's built-in permission-grant policies for the "consent on your own
+# behalf" surface. Assigning one of these to a tenant member controls WHICH
+# OAuth apps that member may consent to (independently of who registered the
+# app in the first place — see UserAppRegistrationRestrictedCheck for that
+# half). The two Microsoft-provided defaults:
+#
+#   - `ManagePermissionGrantsForSelf.microsoft-user-default-legacy` — the
+#     historical default. Users may consent to ANY app requesting ANY
+#     delegated permission classified as "low impact" — which historically
+#     included Mail.Read, Files.Read.All, and other scopes an attacker
+#     considers a primary objective, not a low-impact ask. This is the
+#     "check exists to catch this one setting" situation.
+#   - `ManagePermissionGrantsForSelf.microsoft-user-default-low` — the
+#     tightened default Microsoft recommends. Users may consent only to
+#     apps published by *verified publishers* and only for a Microsoft-
+#     curated subset of low-risk delegated permissions. Attacker-registered
+#     apps (which cannot be verified) can no longer clear the bar.
+#
+# Empty `permissionGrantPoliciesAssigned` = user consent is entirely
+# disabled. Also a passing state.
+#
+# `ManagePermissionGrantsForOwnedResource.*` policies control consent
+# on group-owned resources (e.g. group-owned apps consenting to their own
+# resources) — a distinct surface, ignored by this check.
+LEGACY_USER_CONSENT_POLICY_ID: str = (
+    "ManagePermissionGrantsForSelf.microsoft-user-default-legacy"
+)
+RESTRICTED_USER_CONSENT_POLICY_ID: str = (
+    "ManagePermissionGrantsForSelf.microsoft-user-default-low"
+)
+_USER_CONSENT_POLICY_PREFIX: str = "ManagePermissionGrantsForSelf."
+
+
+class UserConsentToAppsRestrictedCheck(Check):
+    """Verify tenant members cannot consent to arbitrary OAuth apps.
+
+    This is the second half of the illicit-consent-grant surface (MITRE
+    ATT&CK T1528). `UserAppRegistrationRestrictedCheck` prevents members
+    from *registering* attacker-controlled apps; this check prevents
+    members from *consenting* to already-registered attacker-controlled
+    apps. Both must be closed. Nobelium/APT29 leaned on the consent half
+    of this pattern during post-SolarWinds persistence: register the app
+    once with any tenant, then phish users across many tenants into
+    granting Mail.Read / Files.Read.All / offline_access — the resulting
+    refresh tokens survive password rotation, MFA re-enrollment, and
+    Conditional Access re-evaluation until each token is individually
+    revoked.
+
+    The check inspects `authorizationPolicy.defaultUserRolePermissions.
+    permissionGrantPoliciesAssigned` and treats it as passing if:
+
+      1) the list is empty (user consent disabled entirely), OR
+      2) the list contains no `ManagePermissionGrantsForSelf.microsoft-
+         user-default-legacy` entry — i.e. only the restricted default
+         (`microsoft-user-default-low`) or a tenant-defined custom
+         policy is assigned.
+
+    Presence of the legacy policy id fails the check. That id is the
+    tenant default for older Entra tenants — a "we've never touched
+    this" tenant will fail here, and correctly so.
+
+    Assignments that use only `ManagePermissionGrantsForOwnedResource.*`
+    policies are treated as non-applicable to the "consent on your own
+    behalf" surface and produce a pass with an evidence note pointing
+    that out.
+
+    Context shape (shared with GuestInviteRestrictedCheck and
+    UserAppRegistrationRestrictedCheck):
+
+        context["authorization_policy"] = {
+            "defaultUserRolePermissions": {
+                "permissionGrantPoliciesAssigned": [<policy id>, ...],
+                # other fields ignored
+            },
+            # other fields ignored
+        }
+
+    A missing `authorization_policy`, missing
+    `defaultUserRolePermissions`, or missing
+    `permissionGrantPoliciesAssigned` key is treated as an INFO
+    collection gap — the collector may lack Policy.Read.All, or the
+    subkey may have been stripped by an older Graph SDK. Fail-open
+    with a precise remediation, not a critical false-positive.
+    """
+
+    check_id = "m365.user_consent_to_apps_restricted"
+    title = "User consent to OAuth apps restricted to verified publishers"
+    description = (
+        "The Entra ID `permissionGrantPoliciesAssigned` setting governs "
+        "which OAuth apps a tenant member may consent to on their own "
+        "behalf. The Microsoft historical default "
+        "(`microsoft-user-default-legacy`) allows consent to any app for "
+        "any delegated permission classified as 'low impact' — a set "
+        "that includes scopes attackers actively target (Mail.Read, "
+        "Files.Read.All, offline_access). This check verifies the tenant "
+        "has replaced the legacy default with either the restricted "
+        "verified-publishers default (`microsoft-user-default-low`), a "
+        "custom policy, or an empty list (user consent disabled). Pair "
+        "with `m365.user_app_registration_restricted` to close both "
+        "halves of the illicit-consent-grant surface (MITRE T1528)."
+    )
+
+    def evaluate(self, context: dict[str, Any]) -> list[Finding]:
+        policy = context.get("authorization_policy")
+        if policy is None:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.INFO,
+                evidence=(
+                    "authorizationPolicy was not collected from Microsoft "
+                    "Graph; the runtime collector may have lacked the "
+                    "Policy.Read.All permission."
+                ),
+                remediation=(
+                    "Grant the audit application the Policy.Read.All Graph "
+                    "permission (admin consent required) and re-run the "
+                    "collector. The single Graph endpoint required is "
+                    "GET /policies/authorizationPolicy."
+                ),
+                cis_control="CIS 5.1.5", nist_csf="PR.AC-4",
+            )]
+
+        default_role_perms = policy.get("defaultUserRolePermissions")
+        if default_role_perms is None:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.INFO,
+                evidence=(
+                    "authorizationPolicy.defaultUserRolePermissions was not "
+                    "returned by Microsoft Graph; older beta endpoints "
+                    "omitted this subobject."
+                ),
+                remediation=(
+                    "Confirm the collector calls "
+                    "`GET https://graph.microsoft.com/v1.0/policies/"
+                    "authorizationPolicy` and passes the full response "
+                    "through — do not project fields defensively at "
+                    "collection time."
+                ),
+                cis_control="CIS 5.1.5", nist_csf="PR.AC-4",
+            )]
+
+        # permissionGrantPoliciesAssigned may be missing (schema drift),
+        # explicitly [] (consent disabled), or a list of policy ids.
+        if "permissionGrantPoliciesAssigned" not in default_role_perms:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.INFO,
+                evidence=(
+                    "defaultUserRolePermissions.permissionGrantPoliciesAssigned "
+                    "was not present on the collected authorizationPolicy. "
+                    "The subkey is required to determine the tenant's user-"
+                    "consent posture."
+                ),
+                remediation=(
+                    "Re-collect from the v1.0 Graph endpoint. If the "
+                    "collector wraps the response through a typed model, "
+                    "confirm the model is up to date — the "
+                    "permissionGrantPoliciesAssigned field on "
+                    "defaultUserRolePermissions has been GA since 2021 "
+                    "and should always round-trip."
+                ),
+                cis_control="CIS 5.1.5", nist_csf="PR.AC-4",
+            )]
+
+        assigned_raw = default_role_perms.get("permissionGrantPoliciesAssigned") or []
+        # Defensive: a non-list value is a schema drift — INFO, not a fail.
+        if not isinstance(assigned_raw, list):
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.INFO,
+                evidence=(
+                    "defaultUserRolePermissions.permissionGrantPoliciesAssigned "
+                    f"is {type(assigned_raw).__name__} (expected list). "
+                    "Treated as a collection gap rather than a policy finding."
+                ),
+                remediation=(
+                    "Confirm the runtime collector is not projecting the "
+                    "field through a schema that coerces the list."
+                ),
+                cis_control="CIS 5.1.5", nist_csf="PR.AC-4",
+            )]
+
+        assigned = [str(a) for a in assigned_raw]
+        legacy_present = LEGACY_USER_CONSENT_POLICY_ID in assigned
+
+        if legacy_present:
+            return [Finding(
+                check_id=self.check_id, title=self.title, passed=False,
+                severity=Severity.HIGH,
+                evidence=(
+                    "permissionGrantPoliciesAssigned includes "
+                    f"{LEGACY_USER_CONSENT_POLICY_ID!r}; any tenant member "
+                    "can consent to arbitrary OAuth apps requesting "
+                    "'low-impact' delegated permissions (which includes "
+                    "Mail.Read, Files.Read.All, offline_access)."
+                ),
+                remediation=(
+                    "In the Entra admin center, open Identity → "
+                    "Applications → Enterprise applications → Consent and "
+                    "permissions → User consent settings and select "
+                    "either 'Allow user consent for apps from verified "
+                    "publishers, for selected permissions' (recommended) "
+                    "or 'Do not allow user consent'. Equivalent Graph "
+                    "call: PATCH /policies/authorizationPolicy with "
+                    '{"defaultUserRolePermissions": '
+                    '{"permissionGrantPoliciesAssigned": '
+                    '["ManagePermissionGrantsForSelf.microsoft-user-default-low"]}}. '
+                    "After tightening, review any admin-consent requests "
+                    "queued in the interim and audit already-consented "
+                    "enterprise applications (`Get-MgOauth2PermissionGrant`) "
+                    "for over-scoped historical grants — the tightening is "
+                    "prospective, existing consent is preserved."
+                ),
+                cis_control="CIS 5.1.5", nist_csf="PR.AC-4",
+                references=[
+                    "https://learn.microsoft.com/entra/identity/enterprise-apps/configure-user-consent",
+                    "https://learn.microsoft.com/entra/identity/enterprise-apps/manage-consent-requests",
+                    "https://attack.mitre.org/techniques/T1528/",
+                    "https://www.cisecurity.org/benchmark/microsoft_365",
+                ],
+            )]
+
+        # No legacy policy assigned. Report the tightened posture in the
+        # evidence so a hiring manager reviewing the report can tell WHY
+        # it passed.
+        if not assigned:
+            evidence = (
+                "permissionGrantPoliciesAssigned is empty; user consent "
+                "to third-party OAuth apps is disabled entirely."
+            )
+        else:
+            # Split ManagePermissionGrantsForSelf.* (governs user-consent)
+            # from ManagePermissionGrantsForOwnedResource.* (governs
+            # group-owned-resource consent). The latter is not applicable
+            # to this check's threat model; note it in the evidence so
+            # the pass isn't opaque.
+            self_policies = [
+                a for a in assigned if a.startswith(_USER_CONSENT_POLICY_PREFIX)
+            ]
+            owned_policies = [
+                a for a in assigned
+                if a.startswith("ManagePermissionGrantsForOwnedResource.")
+            ]
+            other_policies = [
+                a for a in assigned
+                if a not in self_policies and a not in owned_policies
+            ]
+            if not self_policies:
+                evidence = (
+                    "permissionGrantPoliciesAssigned contains no "
+                    "'ManagePermissionGrantsForSelf.*' entry; user "
+                    "consent to third-party OAuth apps is effectively "
+                    "disabled"
+                )
+                if owned_policies or other_policies:
+                    non_self = owned_policies + other_policies
+                    evidence += (
+                        f" (unrelated non-self policies present: "
+                        f"{', '.join(non_self)})."
+                    )
+                else:
+                    evidence += "."
+            else:
+                evidence = (
+                    "permissionGrantPoliciesAssigned includes "
+                    f"{', '.join(self_policies)} and does NOT include the "
+                    "legacy 'microsoft-user-default-legacy' policy."
+                )
+
+        return [Finding(
+            check_id=self.check_id, title=self.title, passed=True,
+            severity=Severity.HIGH,
+            evidence=evidence,
+            cis_control="CIS 5.1.5", nist_csf="PR.AC-4",
+        )]
+
+
+
 CHECKS: list[Check] = [
     MfaAdminsEnforcedCheck(),
     LegacyAuthDisabledCheck(),
     GuestInviteRestrictedCheck(),
     UserAppRegistrationRestrictedCheck(),
+    UserConsentToAppsRestrictedCheck(),
 ]

@@ -14,12 +14,15 @@ import pytest
 from audit.checks.m365 import (
     ALLOWED_INVITE_FROM,
     LEGACY_CLIENT_APP_TYPES,
+    LEGACY_USER_CONSENT_POLICY_ID,
     MEMBER_USER_ROLE_TEMPLATE_ID,
     PRIVILEGED_ROLE_TEMPLATE_IDS,
+    RESTRICTED_USER_CONSENT_POLICY_ID,
     GuestInviteRestrictedCheck,
     LegacyAuthDisabledCheck,
     MfaAdminsEnforcedCheck,
     UserAppRegistrationRestrictedCheck,
+    UserConsentToAppsRestrictedCheck,
 )
 from audit.findings import Severity
 
@@ -672,3 +675,206 @@ def test_app_reg_reports_info_on_non_bool_allowed_to_create_apps(app_reg_check):
     assert finding.passed is False
     assert finding.severity == Severity.INFO
     assert "expected explicit bool" in finding.evidence
+
+
+# ----------------------------------------------------------------------
+# UserConsentToAppsRestrictedCheck — m365.user_consent_to_apps_restricted
+# (CIS 5.1.5). Shares the authorizationPolicy Graph object with the two
+# checks above; test helpers deliberately reused for the collection-gap
+# assertions so we exercise the same fail-open behaviour.
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def consent_check() -> UserConsentToAppsRestrictedCheck:
+    return UserConsentToAppsRestrictedCheck()
+
+
+def _ctx_with_consent_policies(
+    assigned: list[str] | None,
+    *,
+    include_default_role_perms_key: bool = True,
+) -> dict[str, Any]:
+    """Build a minimal context with a permissionGrantPoliciesAssigned list.
+
+    `assigned=None` produces a defaultUserRolePermissions subobject with the
+    permissionGrantPoliciesAssigned key absent — the schema-drift case.
+    `include_default_role_perms_key=False` omits the defaultUserRolePermissions
+    subobject entirely — the older-beta-endpoint case.
+    """
+    if not include_default_role_perms_key:
+        default_role_perms: dict[str, Any] | None = None
+    else:
+        default_role_perms = {}
+        if assigned is not None:
+            default_role_perms["permissionGrantPoliciesAssigned"] = assigned
+    policy: dict[str, Any] = {}
+    if default_role_perms is not None:
+        policy["defaultUserRolePermissions"] = default_role_perms
+    ctx = _ctx()
+    ctx["authorization_policy"] = policy
+    return ctx
+
+
+def test_consent_passes_when_no_policies_assigned(consent_check):
+    """Empty permissionGrantPoliciesAssigned = user consent disabled entirely.
+    This is the strictest posture and must pass unambiguously."""
+    ctx = _ctx_with_consent_policies([])
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is True
+    assert finding.severity == Severity.HIGH
+    assert finding.cis_control == "CIS 5.1.5"
+    assert finding.nist_csf == "PR.AC-4"
+    assert "disabled entirely" in finding.evidence
+
+
+def test_consent_passes_with_only_restricted_low_policy(consent_check):
+    """Microsoft's recommended tightened posture: only verified publishers,
+    low-risk permissions. `microsoft-user-default-low` alone must pass."""
+    ctx = _ctx_with_consent_policies([RESTRICTED_USER_CONSENT_POLICY_ID])
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is True
+    assert RESTRICTED_USER_CONSENT_POLICY_ID in finding.evidence
+    assert "does NOT include" in finding.evidence
+
+
+def test_consent_passes_with_custom_non_legacy_policy(consent_check):
+    """A tenant-defined custom permission grant policy that isn't the
+    legacy one must pass — the check must not require a Microsoft-named
+    default."""
+    ctx = _ctx_with_consent_policies([
+        "ManagePermissionGrantsForSelf.acme-custom-consent-policy",
+    ])
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is True
+    assert "acme-custom-consent-policy" in finding.evidence
+
+
+def test_consent_fails_when_legacy_policy_present(consent_check):
+    """Tenant default for older Entra tenants — any member can consent to
+    any 'low-impact' delegated permission (which includes Mail.Read /
+    Files.Read.All)."""
+    ctx = _ctx_with_consent_policies([LEGACY_USER_CONSENT_POLICY_ID])
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.HIGH
+    assert finding.cis_control == "CIS 5.1.5"
+    assert LEGACY_USER_CONSENT_POLICY_ID in finding.evidence
+    # Evidence should name the scopes that make this dangerous so a
+    # reviewer immediately understands why "low impact" is misleading.
+    assert "Mail.Read" in finding.evidence
+    assert "offline_access" in finding.evidence
+
+
+def test_consent_fails_when_legacy_and_restricted_both_assigned(consent_check):
+    """A tenant that has ADDED the restricted policy but never removed the
+    legacy one is still exposed — the legacy policy still applies. This is
+    the most common partial-remediation state and must fail closed."""
+    ctx = _ctx_with_consent_policies([
+        LEGACY_USER_CONSENT_POLICY_ID,
+        RESTRICTED_USER_CONSENT_POLICY_ID,
+    ])
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is False
+    assert LEGACY_USER_CONSENT_POLICY_ID in finding.evidence
+
+
+def test_consent_remediation_is_actionable(consent_check):
+    """The failing remediation must contain a copy-pasteable Graph patch
+    body AND point at the historical-consent audit step. Tightening the
+    setting without auditing existing grants doesn't close the exposure —
+    consented refresh tokens survive the policy change."""
+    ctx = _ctx_with_consent_policies([LEGACY_USER_CONSENT_POLICY_ID])
+    [finding] = consent_check.evaluate(ctx)
+    assert '"permissionGrantPoliciesAssigned"' in finding.remediation
+    assert RESTRICTED_USER_CONSENT_POLICY_ID in finding.remediation
+    assert "Get-MgOauth2PermissionGrant" in finding.remediation
+    # Admin-console breadcrumb must be present so a Windows-admin-first
+    # user isn't forced through the API to fix this.
+    assert "Consent and permissions" in finding.remediation
+
+
+def test_consent_references_include_mitre_ms_docs_and_cis(consent_check):
+    """Same three-anchor requirement as UserAppRegistrationRestrictedCheck —
+    MS docs, MITRE ATT&CK T1528, CIS benchmark."""
+    ctx = _ctx_with_consent_policies([LEGACY_USER_CONSENT_POLICY_ID])
+    [finding] = consent_check.evaluate(ctx)
+    joined = " ".join(finding.references)
+    assert "attack.mitre.org/techniques/T1528" in joined
+    assert "configure-user-consent" in joined
+    assert "cisecurity.org/benchmark/microsoft_365" in joined
+
+
+def test_consent_reports_info_when_policy_not_collected(consent_check):
+    """Missing authorization_policy is a collection gap; INFO fail-open."""
+    ctx = _ctx()
+    assert "authorization_policy" not in ctx
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "Policy.Read.All" in finding.remediation
+
+
+def test_consent_reports_info_when_default_role_perms_missing(consent_check):
+    """Partial authorizationPolicy from an older Graph endpoint is a
+    collection gap, not a policy failure."""
+    ctx = _ctx_with_consent_policies(None, include_default_role_perms_key=False)
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "defaultUserRolePermissions" in finding.evidence
+    assert "v1.0" in finding.remediation
+
+
+def test_consent_reports_info_when_grant_policies_key_missing(consent_check):
+    """defaultUserRolePermissions present but without the
+    permissionGrantPoliciesAssigned subkey is schema drift — INFO with a
+    schema-round-trip remediation, not a critical false-positive."""
+    ctx = _ctx_with_consent_policies(None, include_default_role_perms_key=True)
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "permissionGrantPoliciesAssigned" in finding.evidence
+
+
+def test_consent_reports_info_on_non_list_grant_policies(consent_check):
+    """If Microsoft ever returns a scalar or dict here we must fail-open
+    with a schema-drift note, same pattern as the allowed_to_create_apps
+    non-bool case."""
+    ctx = _ctx()
+    ctx["authorization_policy"] = {
+        "defaultUserRolePermissions": {
+            "permissionGrantPoliciesAssigned": "not-a-list",
+        },
+    }
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is False
+    assert finding.severity == Severity.INFO
+    assert "expected list" in finding.evidence
+
+
+def test_consent_passes_when_only_owned_resource_policies_present(consent_check):
+    """ManagePermissionGrantsForOwnedResource.* governs group-owned-resource
+    consent, which is a distinct surface. If ONLY those policies are
+    assigned (no ManagePermissionGrantsForSelf.*), user-consent is
+    effectively disabled and the check must pass — with an evidence note
+    calling out the unrelated policies so an operator isn't confused."""
+    ctx = _ctx_with_consent_policies([
+        "ManagePermissionGrantsForOwnedResource.microsoft-dynamically-managed-permissions-for-team",
+    ])
+    [finding] = consent_check.evaluate(ctx)
+    assert finding.passed is True
+    assert "effectively disabled" in finding.evidence
+    assert "unrelated non-self policies" in finding.evidence
+
+
+def test_consent_policy_constants_are_the_documented_microsoft_ids():
+    """The constants must exactly match Microsoft's documented built-in
+    permission-grant policy ids. Drift here would silently invalidate
+    every consent check in the field."""
+    assert LEGACY_USER_CONSENT_POLICY_ID == (
+        "ManagePermissionGrantsForSelf.microsoft-user-default-legacy"
+    )
+    assert RESTRICTED_USER_CONSENT_POLICY_ID == (
+        "ManagePermissionGrantsForSelf.microsoft-user-default-low"
+    )
